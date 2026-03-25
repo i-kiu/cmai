@@ -5,6 +5,7 @@ CONFIG_FILE="$CONFIG_DIR/config"
 MODEL_FILE="$CONFIG_DIR/model"
 BASE_URL_FILE="$CONFIG_DIR/base_url"
 PROVIDER_FILE="$CONFIG_DIR/provider"
+COMMIT_STYLE_FILE="$CONFIG_DIR/commit_style"
 
 # Debug mode flag
 DEBUG=false
@@ -16,6 +17,16 @@ MESSAGE_ONLY=false
 BRANCH_NAME_ONLY=false
 # Unstaged flag
 UNSTAGED=false
+# Skip interactive commit confirmation (non-interactive / scripting)
+SKIP_PROMPT=false
+
+# When building the diff text used for the AI prompt/comment:
+# ignore blank-line-only changes by default.
+IGNORE_BLANK_LINES=true
+
+# Commit message styles (default: TYPO3)
+COMMIT_STYLE_TYPO3="typo3"
+COMMIT_STYLE_CONVENTIONAL="conventional"
 # Default providers and URLs
 PROVIDER_OPENROUTER="openrouter"
 PROVIDER_OLLAMA="ollama"
@@ -110,12 +121,37 @@ get_base_url() {
     fi
 }
 
+# Function to save commit message style (typo3 | conventional)
+save_commit_style() {
+    echo "$1" >"$COMMIT_STYLE_FILE"
+    chmod 600 "$COMMIT_STYLE_FILE"
+    debug_log "Commit style saved to config file"
+}
+
+# Function to get commit message style (default: typo3)
+get_commit_style() {
+    if [ -f "$COMMIT_STYLE_FILE" ]; then
+        tr '[:upper:]' '[:lower:]' <"$COMMIT_STYLE_FILE" | tr -d '[:space:]'
+    else
+        echo "$COMMIT_STYLE_TYPO3"
+    fi
+}
+
+normalize_commit_style() {
+    case "$(echo "$1" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')" in
+    typo3 | typo) echo "$COMMIT_STYLE_TYPO3" ;;
+    conventional | standard) echo "$COMMIT_STYLE_CONVENTIONAL" ;;
+    *) echo "$COMMIT_STYLE_TYPO3" ;;
+    esac
+}
+
 # Function to print config
 print_config() {
     echo "Current configuration:"
-    echo "  Provider:  $(get_provider)"
-    echo "  Base URL:  $(get_base_url)"
-    echo "  Model:     $(get_model)"
+    echo "  Provider:    $(get_provider)"
+    echo "  Base URL:    $(get_base_url)"
+    echo "  Model:       $(get_model)"
+    echo "  Commit style: $(normalize_commit_style "$(get_commit_style)")"
     API_KEY=$(get_api_key)
     if [ -z "$API_KEY" ]; then
         echo "  API Key:   Not set"
@@ -136,10 +172,7 @@ if [ -z "$PROVIDER" ]; then
     BASE_URL="$OPENROUTER_URL"
 fi
 
-# Default models for providers
-OLLAMA_MODEL="codellama"
-OPENROUTER_MODEL="google/gemini-flash-1.5-8b"
-LMSTUDIO_MODEL="default"
+COMMIT_STYLE=$(normalize_commit_style "$(get_commit_style)")
 
 # Get saved model or use default based on provider
 MODEL=$(get_model)
@@ -150,6 +183,9 @@ if [ -z "$MODEL" ]; then
         ;;
     "$PROVIDER_OPENROUTER")
         MODEL="$OPENROUTER_MODEL"
+        ;;
+    "$PROVIDER_LMSTUDIO")
+        MODEL="$LMSTUDIO_MODEL"
         ;;
     esac
 fi
@@ -226,6 +262,25 @@ while [[ $# -gt 0 ]]; do
         UNSTAGED=true
         shift
         ;;
+    --include-blank-lines)
+        IGNORE_BLANK_LINES=false
+        shift
+        ;;
+    --yes | -y)
+        SKIP_PROMPT=true
+        shift
+        ;;
+    --style)
+        if [[ -n "$2" && "$2" != -* ]]; then
+            COMMIT_STYLE=$(normalize_commit_style "$2")
+            save_commit_style "$COMMIT_STYLE"
+            debug_log "Commit style set to: $COMMIT_STYLE"
+            shift 2
+        else
+            echo "Error: --style requires typo3 or conventional"
+            exit 1
+        fi
+        ;;
     --print-config)
         print_config
         exit 0
@@ -239,6 +294,9 @@ while [[ $# -gt 0 ]]; do
         echo "  --message-only        Generate message only, no git add/commit/push"
         echo "  --branch-name-only    Generate branch name only, no git add/commit/push"
         echo "  --unstaged            Use unstaged changes for diff"
+        echo "  --include-blank-lines Include blank-line-only changes in diff"
+        echo "  --style <name>        Commit format: typo3 (default) or conventional (saved)"
+        echo "  --yes, -y             Commit without confirmation prompt"
         echo "  --model <model>       Use specific model (default: google/gemini-flash-1.5-8b)"
         echo "  --use-ollama          Use Ollama as provider (saves for future use)"
         echo "  --use-openrouter      Use OpenRouter as provider (saves for future use)"
@@ -299,6 +357,8 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+COMMIT_STYLE=$(normalize_commit_style "$(get_commit_style)")
+
 # Get API key from config
 API_KEY=$(get_api_key)
 debug_log "API key retrieved from config"
@@ -337,16 +397,76 @@ fi
 DIFF_RANGE="--cached"
 [ "$UNSTAGED" = true ] && DIFF_RANGE=""
 
-CHANGES=$(git diff $DIFF_RANGE --name-status | tr '\t' ' ' | sed 's/  */ /g')
+NAME_STATUS_RAW=$(git diff $DIFF_RANGE --name-status)
 # Get git diff for context
-DIFF_CONTENT=$(git diff $DIFF_RANGE)
-debug_log "Git changes detected" "$CHANGES"
+DIFF_CONTENT_RAW=$(git diff $DIFF_RANGE)
+
+if [ "$IGNORE_BLANK_LINES" = true ]; then
+    # Only keep file sections where there is at least one addition/deletion line
+    # that is NOT just an empty/whitespace-only line.
+    # This makes DIFF_CONTENT behave like `git diff --ignore-blank-lines` for prompts:
+    # if a file change is "blank-line-only", it disappears from the prompt entirely.
+    DIFF_CONTENT=$(printf '%s\n' "$DIFF_CONTENT_RAW" | awk '
+        function is_blank_add_del(line) {
+            return (line ~ /^[+-][[:space:]]*$/)
+        }
+        function is_nonblank_add_del(line) {
+            # Ignore file headers like "--- a/file" and "+++ b/file"
+            if (line ~ /^\+\+/) return 0
+            if (line ~ /^--/) return 0
+            if (line !~ /^[+-]/) return 0
+            return !is_blank_add_del(line)
+        }
+        /^diff --git /{
+            if (cur != "" && has_nonblank == 1) {
+                printf "%s", content
+            }
+            cur = $3
+            sub(/^a\//, "", cur)
+            has_nonblank = 0
+            content = $0 "\n"
+            next
+        }
+        {
+            if (is_nonblank_add_del($0)) has_nonblank = 1
+            content = content $0 "\n"
+        }
+        END{
+            if (cur != "" && has_nonblank == 1) {
+                printf "%s", content
+            }
+        }
+    ')
+
+    if [ -n "$DIFF_CONTENT" ]; then
+        # Build a keep-list from DIFF_CONTENT so CHANGES matches the files we kept.
+        KEEP_LIST=$(printf '%s\n' "$DIFF_CONTENT" | awk '/^diff --git /{f=$3; sub(/^a\//,"",f); if(!seen[f]++){print f}}')
+        CHANGES=$(printf '%s\n' "$NAME_STATUS_RAW" | awk -v keep_list="$KEEP_LIST" '
+            BEGIN{
+                n=split(keep_list,a,"\n");
+                for (i=1; i<=n; i++) if (a[i]!="") keep[a[i]]=1;
+            }
+            {
+                status=$1;
+                file=$NF; # last field is the "new" filename for rename/copy
+                gsub(/\r$/, "", file);
+                if (file in keep) print status " " file;
+            }')
+    else
+        CHANGES=""
+    fi
+else
+    CHANGES=$(printf '%s\n' "$NAME_STATUS_RAW" | tr '\t' ' ' | sed 's/  */ /g')
+    DIFF_CONTENT="$DIFF_CONTENT_RAW"
+fi
+debug_log "Git changes detected in range $DIFF_RANGE : $CHANGES"
+debug_log "Git diff content: $DIFF_CONTENT"
 
 if [ -z "$CHANGES" ]; then
     if [ "$UNSTAGED" = true ]; then
-        echo "No unstaged changes found."
+        echo "No relevant changes found (after filtering blank-line-only changes)."
     else
-        echo "No staged changes found. Please stage your changes using 'git add' first or use --unstaged flag."
+        echo "No relevant staged changes found (after filtering blank-line-only changes). Please stage your changes using 'git add' first or use --unstaged flag."
     fi
     exit 1
 fi
@@ -360,12 +480,17 @@ if [ -z "$MODEL" ]; then
     "$PROVIDER_OPENROUTER")
         MODEL="$OPENROUTER_MODEL"
         ;;
+    "$PROVIDER_LMSTUDIO")
+        MODEL="$LMSTUDIO_MODEL"
+        ;;
     esac
 fi
 
 # Assemble the user prompt with raw content; jq will handle JSON escaping
+# Note: use `read <<EOF` instead of `$(cat <<EOF)` so lines like `1)` or `type(scope):`
+# do not close the command-substitution `)`.
 if [ "$BRANCH_NAME_ONLY" = true ]; then
-    USER_CONTENT=$(cat <<EOF
+    IFS= read -r -d '' USER_CONTENT <<EOF || true
 Generate a git branch name for these changes:
 
 ## File changes:
@@ -388,10 +513,53 @@ Important:
 - Do not wrap your response in triple backticks
 - Response should be the branch name only, no explanations.
 EOF
-)
+elif [ "$COMMIT_STYLE" = "$COMMIT_STYLE_TYPO3" ]; then
+    IFS= read -r -d '' USER_CONTENT <<EOF || true
+Generate a commit message for these changes. The subject line uses TYPO3-style tags
+(inspired by https://docs.typo3.org/m/typo3/guide-contributionworkflow/main/en-us/Appendix/CommitMessage.html ),
+but do NOT add Forge/Gerrit metadata: no "Resolves:", "Related:", "Releases:", or "Change-Id" lines.
+
+## File changes:
+<file_changes>
+$CHANGES
+</file_changes>
+
+## Diff:
+<diff>
+$DIFF_CONTENT
+</diff>
+
+## Subject line (TYPO3-style tag + summary) — keep rules 1–3 below
+
+1) Start the first line with exactly one keyword in square brackets: [BUGFIX], [FEATURE], [DOCS], or [TASK].
+   If the change is breaking for users/admins/extension authors, prefix the whole line with [!!!]
+   before the keyword, e.g. [!!!][FEATURE] ...
+   Use [SECURITY] only for genuine security fixes.
+
+2) After the keyword, one space, then a short summary in imperative mood (command form: "Fix …", not "Fixed …"),
+   describing what the change does. Capitalize the first letter of the summary.
+   Aim for about 50 characters on the subject; never more than 72 characters for the full first line.
+   Avoid starting the subject with EXT:extensionname (redundant with the diff).
+
+3) If you add a body: there must be one blank line between subject and body.
+
+## Body and overall quality — follow "The seven rules of a great Git commit message":
+https://chris.beams.io/git-commit#seven-rules
+
+Summarize: separate subject from body with a blank line; keep subject ~50 chars (72 max); capitalize the subject;
+do not end the subject with a period; imperative mood in the subject; wrap the body at about 72 characters;
+use the body to explain what and why (not implementation detail — the diff shows how).
+
+Optional bullets in the body may use "* " (asterisk, space). Do not add issue-tracker or Gerrit footer lines
+unless the user diff explicitly contains ticket numbers you should quote (default: omit all such footers).
+
+Important:
+- Do not wrap your response in triple backticks or markdown fences.
+- Output must be the full commit message only, no preamble or explanation.
+EOF
 else
-    USER_CONTENT=$(cat <<EOF
-Generate a commit message for these changes:
+    IFS= read -r -d '' USER_CONTENT <<EOF || true
+Generate a Conventional Commit message for these changes:
 
 ## File changes:
 <file_changes>
@@ -417,12 +585,13 @@ Important:
 - Do not wrap your response in triple backticks
 - Response should be the commit message only, no explanations.
 EOF
-)
 fi
 
 # Define system prompt
 if [ "$BRANCH_NAME_ONLY" = true ]; then
     SYSTEM_PROMPT="You are a git branch name generator. Create concise, standard git branch names."
+elif [ "$COMMIT_STYLE" = "$COMMIT_STYLE_TYPO3" ]; then
+    SYSTEM_PROMPT="You are a commit message assistant. Use a TYPO3-style tagged subject ([BUGFIX]/[FEATURE]/[DOCS]/[TASK], optional [!!!] or [SECURITY]) and shape the message like https://chris.beams.io/git-commit#seven-rules . Never add Resolves/Related/Releases/Change-Id or other Gerrit/Forge footers unless the diff explicitly supplies ticket IDs to cite."
 else
     SYSTEM_PROMPT="You are a git commit message generator. Create conventional commit messages."
 fi
@@ -526,7 +695,7 @@ case "$PROVIDER" in
         echo "Run: ollama serve"
         exit 1
     fi
-    if echo "$RESPONSE" | grep -q "error"; then
+    if echo "$RESPONSE" | jq -e 'type == "object" and (.error | type) != "null"' >/dev/null 2>&1; then
         ERROR=$(echo "$RESPONSE" | jq -r '.error')
         echo "Error from Ollama: $ERROR"
         exit 1
@@ -596,15 +765,41 @@ if [ "$MESSAGE_ONLY" = true ] || [ "$BRANCH_NAME_ONLY" = true ]; then
     exit 0
 fi
 
+echo ""
+echo "Vorschlag für die Commit-Nachricht:"
+echo "────────────────────────────────────"
+echo "$RESULT_MESSAGE"
+echo "────────────────────────────────────"
+echo ""
+
+if [ "$SKIP_PROMPT" = false ]; then
+    if [ ! -t 0 ]; then
+        echo "Kein interaktives Terminal. Zum Committen ohne Rückfrage: --yes (-y). Nur Ausgabe: --message-only."
+        exit 0
+    fi
+    read -r -p "Mit dieser Nachricht committen? [j/N] " reply || true
+    case "$reply" in
+    j | J | y | Y) ;;
+    *)
+        echo "Abgebrochen."
+        exit 0
+        ;;
+    esac
+fi
+
 # If we were in unstaged mode, we need to stage changes before committing
 if [ "$UNSTAGED" = true ]; then
     debug_log "Staging all changes before commit"
     git add .
 fi
 
-# Execute git commit
+COMMIT_MSG_FILE=$(mktemp)
+trap 'rm -f "$COMMIT_MSG_FILE"' EXIT
+
+printf '%s\n' "$RESULT_MESSAGE" >"$COMMIT_MSG_FILE"
+
 debug_log "Executing git commit"
-git commit -m "$RESULT_MESSAGE"
+git commit -F "$COMMIT_MSG_FILE"
 
 if [ $? -ne 0 ]; then
     echo "Failed to commit changes"
@@ -620,9 +815,9 @@ if [ "$PUSH" = true ]; then
         echo "Failed to push changes"
         exit 1
     fi
-    echo "Successfully pushed changes to origin"
+    echo "Push nach origin erfolgreich."
 fi
 
-echo "Successfully committed and pushed changes with message:"
+echo "Commit erfolgreich. Nachricht:"
 echo "$RESULT_MESSAGE"
 debug_log "Script completed successfully"
