@@ -237,6 +237,9 @@ Options:
   --message-only        Generate message only, no git add/commit/push
   --branch-name-only    Generate branch name only, no git add/commit/push
   --unstaged            Use unstaged changes for diff
+  --include-blank-lines Include blank-line-only changes in diff
+  --style <name>        Commit format: typo3 (default) or conventional (saved)
+  --yes, -y             Commit without confirmation prompt
   --model <model>       Use specific model (default: google/gemini-flash-1.5-8b)
   --use-ollama          Use Ollama as provider (saves for future use)
   --use-lmstudio        Use LMStudio as provider (saves for future use)
@@ -341,12 +344,11 @@ Example generated commit messages:
 │ └── git-commit.sh
 ├── .config/
 │ └── git-commit-ai/
-│   ├── config       # API key
-│   ├── model        # Selected AI model
-│   ├── provider     # Selected provider (openrouter/ollama/custom)
-│   └── base_url     # API base URL
-│   ├── model
-│   └── base_url
+│   ├── config        # API key
+│   ├── provider      # Selected provider (openrouter/ollama/custom)
+│   ├── base_url      # API base URL
+│   ├── model         # Selected AI model
+│   └── commit_style # Commit message style (typo3/conventional)
 └── usr/
   └── local/
     └── bin/
@@ -361,9 +363,11 @@ Example generated commit messages:
 │ └── cmai.sh
 └── .config/
   └── git-commit-ai/
-    ├── config
-    ├── model
-    └── base_url
+    ├── config        # API key
+    ├── provider      # Selected provider (openrouter/ollama/custom)
+    ├── base_url      # API base URL
+    ├── model         # Selected AI model
+    └── commit_style # Commit message style (typo3/conventional)
 ```
 
 ## Security
